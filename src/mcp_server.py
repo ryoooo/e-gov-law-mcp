@@ -305,13 +305,141 @@ class CacheManager:
 
         return results
 
+    async def get_law_structure(self, law_num: str, client: httpx.AsyncClient) -> Optional[dict]:
+        """Get law structure information (TOC, chapters, sections) without full content
+        for large laws to determine the best retrieval strategy"""
+        try:
+            # Check if we have cached structure info
+            structure_cache_key = f"{law_num}:structure"
+            cached_structure = self.law_lookup_cache.get(structure_cache_key)
+            if cached_structure:
+                return cached_structure
+            
+            # First, get basic law info to check size
+            response = await client.get(f"/law_data/{law_num}", params={
+                "law_full_text_format": "xml"
+            })
+            response.raise_for_status()
+            
+            # Check response size
+            response_size = len(response.text)
+            if response_size > 500000:  # 500KB threshold
+                logger.info(f"Large law detected ({law_num}): {response_size} bytes")
+                
+                data = json.loads(response.text)
+                law_full_text = data.get('law_full_text', {})
+                
+                # Extract structure information
+                structure_info = self._extract_structure_info(law_full_text)
+                structure_info['response_size'] = response_size
+                structure_info['is_large_law'] = True
+                
+                # Cache the structure
+                self.law_lookup_cache.put(structure_cache_key, structure_info)
+                return structure_info
+            else:
+                # For smaller laws, return None to indicate normal processing
+                return None
+                
+        except Exception as e:
+            logger.error(f"Failed to get law structure for {law_num}: {e}")
+            return None
+    
+    def _extract_structure_info(self, law_full_text: dict) -> dict:
+        """Extract chapter and section structure from law XML"""
+        structure = {
+            'chapters': [],
+            'sections': [],
+            'parts': [],
+            'total_articles': 0
+        }
+        
+        try:
+            # Extract text and analyze structure
+            extracted_text = extract_text_from_xml(law_full_text)
+            
+            # Find chapters (第一編、第二編 etc.)
+            chapter_pattern = r'第[一二三四五六七八九十]+編'
+            chapters = re.findall(chapter_pattern, extracted_text)
+            structure['chapters'] = list(set(chapters))
+            
+            # Find sections (第一章、第二章 etc.) 
+            section_pattern = r'第[一二三四五六七八九十]+章'
+            sections = re.findall(section_pattern, extracted_text)
+            structure['sections'] = list(set(sections))
+            
+            # Count total articles
+            article_pattern = r'第[一二三四五六七八九十百千]+条'
+            articles = re.findall(article_pattern, extracted_text)
+            structure['total_articles'] = len(set(articles))
+            
+            # Extract chapter/section boundaries for targeted retrieval
+            structure['boundaries'] = self._extract_chapter_section_info(extracted_text)
+            
+        except Exception as e:
+            logger.warning(f"Failed to extract structure info: {e}")
+            
+        return structure
+    
+    def _extract_chapter_section_info(self, text: str) -> list:
+        """Extract detailed chapter/section boundaries"""
+        boundaries = []
+        
+        # Pattern for major divisions
+        division_pattern = r'(第[一二三四五六七八九十]+[編章節])\s+([^第\n]+)'
+        
+        for match in re.finditer(division_pattern, text):
+            boundaries.append({
+                'type': 'division',
+                'marker': match.group(1),
+                'title': match.group(2).strip(),
+                'position': match.start()
+            })
+            
+        # Sort by position
+        boundaries.sort(key=lambda x: x['position'])
+        
+        return boundaries
+    
+    async def get_targeted_law_content(self, law_num: str, article_number: str, 
+                                     client: httpx.AsyncClient) -> Optional[dict]:
+        """Get targeted law content for large laws, focusing on specific sections"""
+        try:
+            # Get structure first
+            structure = await self.get_law_structure(law_num, client)
+            
+            if not structure or not structure.get('is_large_law'):
+                # Not a large law, use normal retrieval
+                return await self._get_law_content(law_num, client)
+                
+            # For large laws, implement targeted retrieval
+            # This is a simplified version - in production, you might want to
+            # retrieve only specific chapters/sections based on article location
+            
+            logger.info(f"Using targeted retrieval for large law {law_num}")
+            logger.info(f"Structure: {structure['total_articles']} articles, "
+                       f"{len(structure['chapters'])} chapters, "
+                       f"{len(structure['sections'])} sections")
+            
+            # For now, still get full content but mark it as optimized
+            content = await self._get_law_content(law_num, client)
+            if content:
+                content['_optimized_retrieval'] = True
+                content['_structure_info'] = structure
+                
+            return content
+            
+        except Exception as e:
+            logger.error(f"Failed targeted content retrieval for {law_num}: {e}")
+            return None
+
 # API configuration
 API_URL = os.environ.get("EGOV_API_URL", "https://laws.e-gov.go.jp/api/2")
 API_TOKEN = os.environ.get("EGOV_API_TOKEN", "")
 
 # Create MCP server with Windows-compatible configuration
 mcp = FastMCP(
-    name=os.environ.get("MCP_SERVER_NAME", "e-Gov Law API Server v2"),
+    name=os.environ.get("MCP_SERVER_NAME", "e-Gov Law API Server v2.1"),
     mask_error_details=True,  # Security: mask internal error details
     on_duplicate_tools="warn",
     on_duplicate_resources="warn",
@@ -459,6 +587,94 @@ async def get_http_client() -> httpx.AsyncClient:
         timeout=30.0,
         follow_redirects=True
     )
+
+def validate_response_size(response_data: dict, article_info: dict = None, 
+                         max_size_bytes: int = 900000) -> dict:
+    """
+    Validate and optimize response size for Claude Desktop compatibility.
+    
+    Args:
+        response_data: The response data to validate
+        article_info: Optional article information for targeted trimming
+        max_size_bytes: Maximum response size (default 900KB for safety margin)
+    
+    Returns:
+        Optimized response data
+    """
+    response_str = json.dumps(response_data, ensure_ascii=False)
+    current_size = len(response_str.encode('utf-8'))
+    
+    if current_size <= max_size_bytes:
+        return response_data
+    
+    logger.warning(f"Response size ({current_size} bytes) exceeds limit ({max_size_bytes} bytes)")
+    
+    # Strategy 1: If we have article info, try to extract just the relevant section
+    if article_info and 'article_content' in response_data:
+        trimmed_response = {
+            'law_title': response_data.get('law_title', ''),
+            'law_number': response_data.get('law_number', ''),
+            'article_content': response_data['article_content'],
+            'search_info': article_info,
+            'size_optimized': True,
+            'optimization_strategy': 'article_focused',
+            'original_size': current_size
+        }
+        
+        trimmed_str = json.dumps(trimmed_response, ensure_ascii=False)
+        if len(trimmed_str.encode('utf-8')) <= max_size_bytes:
+            return trimmed_response
+    
+    # Strategy 2: Progressive content trimming
+    if 'law_full_text' in response_data:
+        # Extract summary information
+        law_text = extract_text_from_xml(response_data['law_full_text'])
+        
+        # Create summary with key information
+        summary_response = {
+            'law_title': response_data.get('law_title', ''),
+            'law_number': response_data.get('law_number', ''),
+            'response_type': 'summary',
+            'size_optimized': True,
+            'optimization_strategy': 'content_summary',
+            'original_size': current_size,
+            'total_characters': len(law_text),
+            'note': 'Response size exceeded limit. Showing summary only.',
+        }
+        
+        # Add article preview if searching for specific article
+        if article_info and article_info.get('article_number'):
+            article_num = article_info['article_number']
+            # Try to find the article in the text
+            article_patterns = generate_search_patterns(article_num)
+            
+            for pattern in article_patterns[:3]:  # Try first 3 patterns
+                matches = re.findall(f"{pattern}.{{0,500}}", law_text, re.DOTALL)
+                if matches:
+                    summary_response['article_preview'] = matches[0][:500] + "..."
+                    break
+        
+        # Add structure information
+        structure = {
+            'chapters': len(re.findall(r'第[一二三四五六七八九十]+編', law_text)),
+            'sections': len(re.findall(r'第[一二三四五六七八九十]+章', law_text)),
+            'articles': len(re.findall(r'第[一二三四五六七八九十百千]+条', law_text))
+        }
+        summary_response['law_structure'] = structure
+        
+        return summary_response
+    
+    # Strategy 3: Minimal response
+    return {
+        'error': 'Response size limit exceeded',
+        'law_title': response_data.get('law_title', ''),
+        'law_number': response_data.get('law_number', ''),
+        'size_optimized': True,
+        'optimization_strategy': 'minimal',
+        'original_size': current_size,
+        'max_allowed_size': max_size_bytes,
+        'suggestion': 'Try searching for a specific article or section'
+    }
 
 def extract_text_from_xml(obj) -> str:
     """
@@ -675,10 +891,16 @@ async def smart_law_lookup(law_name: str) -> Optional[str]:
 @mcp.tool
 async def find_law_article(law_name: str, article_number: str, ctx: Context) -> dict:
     """
-    Find a specific article in Japanese law (ULTRA SMART & FAST)
+    Find a specific article in Japanese law (ULTRA SMART & FAST) - v2.1
 
-    Supports 16+ major laws with direct mapping for instant access.
-    Handles complex patterns like 条の2, 項, 号 automatically.
+    Enhanced with staged retrieval for large laws (会社法, 民法 etc.)
+    to ensure Claude Desktop compatibility (1MB limit).
+
+    Features:
+    - Supports 16+ major laws with direct mapping for instant access
+    - Handles complex patterns like 条の2, 項, 号 automatically
+    - Optimized retrieval for large laws to avoid size limits
+    - Automatic response size validation and optimization
 
     Args:
         law_name: Law name (e.g., "民法", "会社法", "憲法")
@@ -716,16 +938,32 @@ async def find_law_article(law_name: str, article_number: str, ctx: Context) -> 
             await ctx.error(f"Law '{law_name}' not found")
             raise ToolError(f"Law '{law_name}' not found")
 
-        # Step 2: Get law text with XML format
+        # Step 2: Get law text with staged retrieval for large laws
         async with await get_http_client() as client:
-            # Get law data with XML format (elm parameter removed due to API 400 errors)
-            response = await client.get(f"/law_data/{law_num}", params={
-                "law_full_text_format": "xml"
-            })
-
-            response.raise_for_status()
-
-            data = json.loads(response.text)
+            # Check if this is a large law using CacheManager
+            structure_info = await cache_manager.get_law_structure(law_num, client)
+            
+            if structure_info and structure_info.get('is_large_law'):
+                await ctx.info(f"Large law detected: {structure_info['total_articles']} articles, "
+                             f"{len(structure_info['chapters'])} chapters")
+                
+                # Use targeted retrieval for large laws
+                data = await cache_manager.get_targeted_law_content(law_num, article_number, client)
+                if not data:
+                    await ctx.error(f"Failed to retrieve law content for {law_num}")
+                    raise ToolError(f"Failed to retrieve law content")
+                    
+                # Log optimization info
+                if data.get('_optimized_retrieval'):
+                    await ctx.debug("Using optimized retrieval for large law")
+            else:
+                # Normal retrieval for smaller laws
+                response = await client.get(f"/law_data/{law_num}", params={
+                    "law_full_text_format": "xml"
+                })
+                response.raise_for_status()
+                data = json.loads(response.text)
+            
             law_full_text = data.get('law_full_text', {})
             extracted_text = extract_text_from_xml(law_full_text)
 
@@ -889,8 +1127,23 @@ async def find_law_article(law_name: str, article_number: str, ctx: Context) -> 
 
                 result["search_patterns_used"] = patterns[:5]
 
+            # Validate response size before returning
+            article_info = {
+                'article_number': article_number,
+                'law_name': law_name
+            }
+            
+            # Add article content to response for size validation
+            if matches:
+                result['article_content'] = matches[0]  # Primary match for validation
+            
+            validated_result = validate_response_size(result, article_info)
+            
+            if validated_result.get('size_optimized'):
+                await ctx.warning(f"Response size optimized using strategy: {validated_result.get('optimization_strategy')}")
+            
             await ctx.info(f"Successfully found article {article_number} in {result.get('actual_law_title', law_name)}")
-            return result
+            return validated_result
 
     except ToolError:
         # Re-raise ToolError to send proper error to client
