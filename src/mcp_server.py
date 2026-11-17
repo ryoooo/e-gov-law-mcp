@@ -24,7 +24,7 @@ import time
 import xml.etree.ElementTree as ET
 from collections import OrderedDict
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Optional, TypedDict
 
 import httpx
 import yaml
@@ -223,18 +223,9 @@ class CacheManager:
 
         # API lookup
         try:
-            response = await client.get("/laws", params={
-                "law_title": law_name,
-                "law_type": "Act",
-                "limit": 5
-            })
-            response.raise_for_status()
-
-            data = json.loads(response.text)
-            laws = data.get("laws", [])
-
-            if laws:
-                law_num = laws[0].get("law_info", {}).get("law_num")
+            best_law = await search_law_by_title(client, law_name)
+            if best_law:
+                law_num = best_law.get("law_info", {}).get("law_num")
                 if law_num:
                     self.law_lookup_cache.put(cache_key, law_num)
                     return law_num
@@ -356,6 +347,7 @@ class ConfigLoader:
             "著作権": "著作権法",
             "特許": "特許法",
             "建基法": "建築基準法",
+            "憲法": "日本国憲法",
 
             # 分野別検索
             "税法": "所得税法",
@@ -376,7 +368,7 @@ class ConfigLoader:
             "憲法": "昭和二十一年憲法",
             "日本国憲法": "昭和二十一年憲法",
             "刑法": "明治四十年法律第四十五号",
-            "商法": "昭和二十三年法律第二十五号",
+            "商法": "明治三十二年法律第四十八号",
             "民事訴訟法": "平成八年法律第百九号",
             "刑事訴訟法": "昭和二十三年法律第百三十一号",
 
@@ -392,6 +384,12 @@ class ConfigLoader:
             "独占禁止法": "昭和二十二年法律第五十四号",
             "消費者契約法": "平成十二年法律第六十一号",
             "特定受託事業者に係る取引の適正化等に関する法律": "令和五年法律第二十五号",
+            # 税法 (Tax Laws)
+            "消費税法": "昭和六十三年法律第百八号",
+            "相続税法": "昭和二十五年法律第七十三号",
+            "地方税法": "昭和二十五年法律第二百二十六号",
+            "国税通則法": "昭和三十七年法律第六十六号",
+            "租税特別措置法": "昭和三十二年法律第二十六号",
         }
 
     def _load_config(self) -> dict[str, Any]:
@@ -579,6 +577,401 @@ def generate_search_patterns(article_input: str) -> list[str]:
     # Remove duplicates while preserving order
     return list(dict.fromkeys(patterns))
 
+
+# ---------------------------------------------------------------------------
+# 法令の選択
+#
+# e-Gov API v2 では、法令の題名は revision_info.law_title にあり、law_info には
+# 法令番号・法令ID・公布日しかない。また /laws の law_title は部分一致で検索される
+# ため、「消費税法」で検索すると、題名に「消費税法」を含む改正法や特例法
+# （平成二十四年法律第六十八号など）も候補に入る。
+# そのため、題名が入力と一致する候補を、他のどの条件よりも優先する。
+# ---------------------------------------------------------------------------
+
+
+def get_law_title(law: dict[str, Any]) -> str:
+    """e-Gov API v2 のレコード（/laws の 1 件、または /law_data の応答）から題名を返す。"""
+    revision_info = law.get("revision_info") or {}
+    return revision_info.get("law_title") or ""
+
+
+def get_law_abbrevs(law: dict[str, Any]) -> set[str]:
+    """登録された略称（revision_info.abbrev。カンマ区切り）を返す。"""
+    abbrev = (law.get("revision_info") or {}).get("abbrev") or ""
+    return {a.strip() for a in re.split(r"[,，、]", abbrev) if a.strip()}
+
+
+def is_law_repealed(law: dict[str, Any]) -> bool:
+    """廃止・失効の印があれば True（廃止されていない場合、API は文字列 "None" を返す）。"""
+    status = (law.get("revision_info") or {}).get("repeal_status")
+    return status not in (None, "", "None")
+
+
+def _title_equals(title: str, name: str) -> bool:
+    """題名の完全一致。「昭和二十二年法律第五十四号（…）」の形の題名にも対応する。"""
+    return title == name or title.endswith(f"（{name}）")
+
+
+def law_title_matches(law: dict[str, Any], law_name: str) -> bool:
+    """
+    レコードが law_name という名前の法令であれば True。
+
+    題名の完全一致、「法令番号（題名）」の形（独占禁止法など）、登録された略称の
+    いずれかで判定する。
+    """
+    name = law_name.strip()
+    if not name:
+        return False
+    return _title_equals(get_law_title(law), name) or name in get_law_abbrevs(law)
+
+
+def select_best_law(laws: list[dict[str, Any]], law_name: str) -> Optional[dict[str, Any]]:
+    """
+    /laws の検索結果から、law_name に最もよく当たる法令を選ぶ。
+
+    優先順位: 題名の完全一致 > 略称の一致 > 廃止されていない > 題名が短い
+    （その法令を題名に含むだけの法令より、本体の法令を選ぶ） > 公布日が新しい
+    """
+    if not laws:
+        return None
+    name = law_name.strip()
+
+    def sort_key(law: dict[str, Any]) -> tuple[bool, bool, bool, int, str]:
+        title = get_law_title(law)
+        return (
+            _title_equals(title, name),
+            name in get_law_abbrevs(law),
+            not is_law_repealed(law),
+            -len(title) if title else -(10**6),
+            (law.get("law_info") or {}).get("promulgation_date") or "",
+        )
+
+    return max(laws, key=sort_key)
+
+
+async def search_law_by_title(client: httpx.AsyncClient, law_name: str) -> Optional[dict[str, Any]]:
+    """
+    題名で /laws を検索し、最もよく当たる法令のレコードを返す。
+
+    まず法律（law_type=Act）に絞って検索する。題名が一致する法律がなければ、種別を絞らずに
+    検索し直す（日本国憲法や、施行令・施行規則などは Act ではないため）。
+    """
+    response = await client.get(
+        "/laws", params={"law_title": law_name, "law_type": "Act", "limit": 20}
+    )
+    response.raise_for_status()
+    laws = json.loads(response.text).get("laws", [])
+    best_law = select_best_law(laws, law_name)
+
+    if best_law is None or not law_title_matches(best_law, law_name):
+        response = await client.get("/laws", params={"law_title": law_name, "limit": 20})
+        response.raise_for_status()
+        any_type_laws = json.loads(response.text).get("laws", [])
+        any_type_best = select_best_law(any_type_laws, law_name)
+        if any_type_best is not None and (
+            best_law is None or law_title_matches(any_type_best, law_name)
+        ):
+            best_law = any_type_best
+            laws = any_type_laws
+
+    if best_law is None:
+        return None
+
+    logger.info(f"Found {len(laws)} candidate laws for '{law_name}'")
+    for i, law in enumerate(laws[:3]):  # 上位 3 件をログに残す
+        logger.info(
+            f"  Candidate {i+1}: {get_law_title(law) or 'N/A'} ({(law.get('law_info') or {}).get('law_num', 'N/A')})"
+        )
+    if not law_title_matches(best_law, law_name):
+        logger.warning(
+            f"No exact title match for '{law_name}'; using closest candidate: "
+            f"{get_law_title(best_law)} ({(best_law.get('law_info') or {}).get('law_num')})"
+        )
+    return best_law
+
+
+# ---------------------------------------------------------------------------
+# 条文の構造的な取り出し
+#
+# 全文を平文にして「第一条」を探すと、目次（TOC）や、条番号を第一条から振り直す
+# 附則（SupplProvision）にも当たる。法令 XML ではこれらが要素で区別されているので、
+# 本則（MainProvision）の Article/@Num で条を特定する。
+# ---------------------------------------------------------------------------
+
+_KANJI_DIGITS = {
+    "〇": 0,
+    "零": 0,
+    "一": 1,
+    "二": 2,
+    "三": 3,
+    "四": 4,
+    "五": 5,
+    "六": 6,
+    "七": 7,
+    "八": 8,
+    "九": 9,
+}
+_KANJI_UNITS = {"十": 10, "百": 100, "千": 1000}
+_FULLWIDTH_DIGITS = str.maketrans("０１２３４５６７８９", "0123456789")
+
+
+def kanji_to_arabic(kanji: str) -> int:
+    """漢数字（例: 「三百二十五」）を整数（325）に変換する。"""
+    total, current = 0, 0
+    for ch in kanji:
+        if ch in _KANJI_DIGITS:
+            current = current * 10 + _KANJI_DIGITS[ch]
+        elif ch in _KANJI_UNITS:
+            total += (current or 1) * _KANJI_UNITS[ch]
+            current = 0
+    return total + current
+
+
+def normalize_article_number(article_input: str) -> str:
+    """条番号の指定に含まれる全角数字・漢数字を半角数字にそろえる。"""
+    text = article_input.strip().translate(_FULLWIDTH_DIGITS)
+    return re.sub(
+        r"[〇零一二三四五六七八九十百千]+", lambda m: str(kanji_to_arabic(m.group(0))), text
+    )
+
+
+def _branch_num(main: str, branches: str) -> str:
+    """「325」と「の3」から XML の Num 表記「325_3」を作る。"""
+    return "_".join([main] + re.findall(r"[0-9]+", branches))
+
+
+class ArticleReference(TypedDict):
+    """parse_article_reference の戻り値。article と item は XML の Num 表記（例: "325_3"）"""
+
+    article: str
+    paragraph: Optional[str]
+    item: Optional[str]
+
+
+def parse_article_reference(article_input: str) -> Optional[ArticleReference]:
+    """
+    条番号の指定を解釈する。
+
+    受け付ける形は「（第）N（条）（のM）…（第P項）（第Q号（のR）…）」で、全角数字・漢数字・空白も使える。
+    例: "192"、"325条の3"、"第9条第2項"、"第二条第一項第三号"、"2条3号の2"。
+    「条」を省けるのは条番号だけのとき（"192"、"325の3"）に限る（「12項」を「1条2項」と読まない）。
+
+    次の指定は受け付けず、None を返す: 号の細目（"第2条第1項第3号イ"）、附則・前文、
+    法令名を含む指定（"民法第192条"）、範囲や列挙（"192-193"）、50 文字を超える入力。
+    """
+    # Python の整数と文字列の変換の桁数上限（4300 桁）に触れないため
+    if len(article_input) > 50:
+        return None
+    text = re.sub(r"\s", "", normalize_article_number(article_input))
+    m = re.fullmatch(
+        r"第?([0-9]+)(条)?((?:の[0-9]+)*)(?:第?([0-9]+)項)?(?:第?([0-9]+)号((?:の[0-9]+)*))?", text
+    )
+    if m is None:
+        return None
+    article, has_article_mark, article_branches, paragraph, item, item_branches = m.groups()
+    if has_article_mark is None and (paragraph or item):
+        return None
+    return {
+        "article": _branch_num(article, article_branches),
+        "paragraph": paragraph,
+        "item": _branch_num(item, item_branches) if item else None,
+    }
+
+
+def format_article_label(num: str) -> str:
+    """XML の Num 表記を表示用にする（"325_3" -> "第325条の3"）。"""
+    main, *branches = num.split("_")
+    return f"第{main}条" + "".join(f"の{b}" for b in branches)
+
+
+def _num_key(num: str) -> Optional[tuple[int, ...]]:
+    parts = num.split("_")
+    return tuple(int(p) for p in parts) if all(p.isdigit() for p in parts) else None
+
+
+def _article_num_matches(xml_num: str, wanted: str) -> bool:
+    """Num が一致するか、削除された条の範囲表記（例: Num="38:84"）に含まれれば True。"""
+    if xml_num == wanted:
+        return True
+    if ":" not in xml_num:
+        return False
+    start, end = (_num_key(n) for n in xml_num.split(":", 1))
+    key = _num_key(wanted)
+    if start is None or end is None or key is None:
+        return False
+    return start <= key <= end
+
+
+def parse_law_xml(law_full_text: Any) -> Optional[ET.Element]:
+    """/law_data（law_full_text_format=xml）が返す Base64 の法令 XML を解析する。"""
+    if not isinstance(law_full_text, str):
+        return None
+    try:
+        return ET.fromstring(base64.b64decode(law_full_text).decode("utf-8"))
+    except Exception as e:
+        logger.warning(f"Failed to parse law XML: {e}")
+        return None
+
+
+_TITLE_TAGS = {"ParagraphNum", "ItemTitle"} | {f"Subitem{i}Title" for i in range(1, 11)}
+_SENTENCE_TAGS = {"ParagraphSentence", "ItemSentence"} | {
+    f"Subitem{i}Sentence" for i in range(1, 11)
+}
+_BLOCK_TAGS = {"Paragraph", "Item"} | {f"Subitem{i}" for i in range(1, 11)}
+
+
+def _xml_inline_text(element: ET.Element) -> str:
+    """要素の文字列。ルビの読み（<Rt>）と、整形用の改行・字下げを除く。"""
+
+    def collect(e: ET.Element) -> str:
+        parts = [e.text or ""]
+        for child in e:
+            if child.tag != "Rt":
+                parts.append(collect(child))
+            parts.append(child.tail or "")
+        return "".join(parts)
+
+    return re.sub(r"\s*\n\s*", "", collect(element)).strip()
+
+
+def _xml_sentence_text(element: ET.Element) -> str:
+    """文の要素の文字列。Column（号の「用語　定義」など）は全角空白で区切る。"""
+    columns = element.findall("Column")
+    if columns:
+        return "　".join(_xml_inline_text(c) for c in columns)
+    return _xml_inline_text(element)
+
+
+def _render_provision(element: ET.Element, lines: list[str], lead: str = "") -> None:
+    """条・項・号などの要素を、法令集と同じ体裁（「第一条　…」「２　…」「一　…」）で lines に書き出す。"""
+    if element.tag == "Article":
+        title = ""
+        for child in element:
+            if child.tag == "ArticleCaption":
+                lines.append(_xml_inline_text(child))
+            elif child.tag == "ArticleTitle":
+                title = _xml_inline_text(child)
+        title = lead or title
+        first = True
+        for child in element:
+            if child.tag in ("ArticleCaption", "ArticleTitle"):
+                continue
+            if first and child.tag == "Paragraph":
+                _render_provision(child, lines, lead=title)
+                first = False
+            else:
+                _render_provision(child, lines)
+        if first and title:
+            lines.append(title)
+        return
+
+    if element.tag in _BLOCK_TAGS:
+        title, body, rest = "", "", []
+        for child in element:
+            if child.tag in _TITLE_TAGS:
+                title = _xml_inline_text(child)
+            elif child.tag in _SENTENCE_TAGS:
+                body = _xml_sentence_text(child)
+            elif child.tag.endswith("Caption"):
+                lines.append(_xml_inline_text(child))
+            else:
+                rest.append(child)
+        if lead and title:
+            lines.append(lead)
+            head = title
+        else:
+            head = lead or title
+        lines.append(f"{head}　{body}" if head and body else (head or body))
+        for child in rest:
+            _render_provision(child, lines)
+        return
+
+    # 表・リスト・改正規定の文などは、要素ごとに 1 行で文字列を残す
+    text = "　".join(t.strip() for t in element.itertext() if t.strip())
+    if text:
+        lines.append(text)
+
+
+def find_article_in_law_xml(root: ET.Element, article_input: str) -> dict[str, Any]:
+    """
+    法令 XML の本則から条（必要に応じて項・号）を探す。
+
+    {"status": ..., "text": str | None, "article_num": str | None} を返す。
+    status は "found"、"article_not_found"、"paragraph_not_found"、"item_not_found"、
+    "invalid_reference"（解釈できない指定。parse_article_reference を参照）のいずれか。
+    """
+    ref = parse_article_reference(article_input)
+    if ref is None:
+        return {"status": "invalid_reference", "text": None, "article_num": None}
+    result: dict[str, Any] = {
+        "status": "article_not_found",
+        "text": None,
+        "article_num": ref["article"],
+    }
+
+    articles: list[ET.Element] = []
+    main = root.find(".//MainProvision")
+    if main is not None:
+        # 改正規定（AmendProvision）の中に引用された条は、この法令自体の条ではない
+        quoted = {id(a) for ap in main.iter("AmendProvision") for a in ap.iter("Article")}
+        articles = [a for a in main.iter("Article") if id(a) not in quoted]
+
+    article = next(
+        (a for a in articles if _article_num_matches(a.get("Num") or "", ref["article"])), None
+    )
+    if article is None:
+        return result
+
+    caption = article.find("ArticleCaption")
+    title_element = article.find("ArticleTitle")
+    article_title = _xml_inline_text(title_element) if title_element is not None else ""
+    lines: list[str] = []
+
+    if ref["paragraph"] is None and ref["item"] is None:
+        _render_provision(article, lines)
+    else:
+        paragraph_num = ref["paragraph"] or "1"
+        paragraph = next(
+            (p for p in article.findall("Paragraph") if p.get("Num") == paragraph_num), None
+        )
+        if paragraph is None:
+            result["status"] = "paragraph_not_found"
+            return result
+        if caption is not None:
+            lines.append(_xml_inline_text(caption))
+        # 見出しは「第九条第二項」の形にする（憲法のように項番号が印字されない法令もあるため）
+        lead = article_title
+        if ref["paragraph"] is not None and paragraph_num != "1":
+            lead += f"第{arabic_to_kanji(paragraph_num)}項"
+        if ref["item"] is None:
+            _render_provision(paragraph, lines, lead=lead)
+        else:
+            item = next((i for i in paragraph.findall("Item") if i.get("Num") == ref["item"]), None)
+            if item is None:
+                result["status"] = "item_not_found"
+                return result
+            if ref["paragraph"] is not None and paragraph_num == "1":
+                lead += "第一項"
+            lines.append(lead)
+            _render_provision(item, lines)
+
+    result.update(status="found", text="\n".join(line for line in lines if line))
+    return result
+
+
+def extract_article(law_full_text: Any, article_number: str) -> dict[str, Any]:
+    """
+    /law_data の law_full_text から、本則の条文を取り出す。
+
+    戻り値は find_article_in_law_xml と同じ。XML として解析できない応答は、
+    推測した条文を返さず ToolError にする。
+    """
+    root = parse_law_xml(law_full_text)
+    if root is None:
+        raise ToolError("Failed to parse the law text (XML) returned by the e-Gov API")
+    return find_article_in_law_xml(root, article_number)
+
+
 async def smart_law_lookup(law_name: str) -> Optional[str]:
     """Smart law lookup with formal name verification and direct mapping fallback to search."""
     law_name_clean = law_name.strip()
@@ -607,64 +1000,13 @@ async def smart_law_lookup(law_name: str) -> Optional[str]:
 
     # Step 4: Intelligent search for unknown laws
     async with await get_http_client() as client:
-        response = await client.get("/laws", params={
-            "law_title": law_name_clean,
-            "law_type": "Act",
-            "limit": 20
-        })
-        response.raise_for_status()
-
-        data = json.loads(response.text)
-        laws = data.get("laws", [])
-
-        if not laws:
+        best_law = await search_law_by_title(client, law_name_clean)
+        if best_law is None:
             logger.warning(f"No laws found for search term: {law_name_clean} (original: {original_input})")
             return None
 
-        # Log search results for transparency
-        logger.info(f"Found {len(laws)} candidate laws for '{law_name_clean}' (original: '{original_input}')")
-        for i, law in enumerate(laws[:3]):  # Log top 3 candidates
-            law_info = law.get('law_info', {})
-            logger.info(f"  Candidate {i+1}: {law_info.get('law_title', 'N/A')} ({law_info.get('law_num', 'N/A')})")
-
-        # Smart scoring for best law selection
-        def score_law(law_info):
-            law_num = law_info.get("law_num", "")
-            score = 0
-
-            # Era preference (modern laws preferred)
-            if "令和" in law_num: score += 3000
-            elif "平成" in law_num: score += 2000
-            elif "昭和" in law_num: score += 1000
-            elif "明治" in law_num: score += 500
-
-            # Prefer shorter law numbers (basic laws)
-            if len(law_num) < 25: score += 100
-
-            # Year extraction for tie-breaking
-            year_match = re.search(r'([元一二三四五六七八九十]+)年', law_num)
-            if year_match:
-                year_str = year_match.group(1)
-                if year_str == "元": score += 1
-                else:
-                    # Simple kanji to number conversion
-                    kanji_map = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
-                               "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
-                    if "十" in year_str:
-                        parts = year_str.split("十")
-                        tens = kanji_map.get(parts[0], 1) if parts[0] else 1
-                        ones = kanji_map.get(parts[1], 0) if parts[1] else 0
-                        score += tens * 10 + ones
-                    else:
-                        score += kanji_map.get(year_str, 0)
-
-            return score
-
-        best_law = max(laws, key=lambda law: score_law(law.get("law_info", {})))
-        selected_law_num = best_law.get("law_info", {}).get("law_num")
-        selected_law_title = best_law.get("law_info", {}).get("law_title")
-
-        logger.info(f"Selected law: {selected_law_title} ({selected_law_num}) for search term '{law_name_clean}' (original: '{original_input}')")
+        selected_law_num = (best_law.get("law_info") or {}).get("law_num")
+        logger.info(f"Selected law: {get_law_title(best_law)} ({selected_law_num}) for search term '{law_name_clean}' (original: '{original_input}')")
 
         # Cache the result
         if selected_law_num:
@@ -727,136 +1069,22 @@ async def find_law_article(law_name: str, article_number: str, ctx: Context) -> 
 
             data = json.loads(response.text)
             law_full_text = data.get('law_full_text', {})
-            extracted_text = extract_text_from_xml(law_full_text)
 
-            # Step 3: Smart article search
-            patterns = generate_search_patterns(article_number)
-            matches = []
-
-            for pattern in patterns:
-                # Enhanced text extraction for complete articles
-                article_pattern = re.escape(pattern)
-
-                # Find all matches first and filter for actual content vs table of contents
-                all_matches = []
-
-                # Find all occurrences of the pattern
-                for match in re.finditer(article_pattern, extracted_text):
-                    pos = match.start()
-
-                    # Check if this is the START of an actual article (not a reference)
-                    # Look at context before the match
-                    context_before = extracted_text[max(0, pos-50):pos]
-                    context_after = extracted_text[pos:pos+100]
-
-                    # Skip if this appears to be a reference within another article
-                    if re.search(r'第\d+条.*第\d+条', context_before + context_after):
-                        continue  # This is likely a reference, not the actual article start
-
-                    # Look for patterns that indicate this is an actual article start
-                    is_actual_article = False
-
-                    # Pattern 1: Article number followed by title/content structure
-                    if re.search(rf'{article_pattern}\s*\n\s*\n\s*\n\s*', extracted_text[pos:pos+200]):
-                        is_actual_article = True
-
-                    # Pattern 2: Article number at start of line with proper indentation
-                    if context_before.endswith('\n              ') or context_before.endswith('            '):
-                        is_actual_article = True
-
-                    # Pattern 3: Article number followed by paragraph structure
-                    if re.search(rf'{article_pattern}\s*\n.*?\n.*?\n.*?[あ-ん]', extracted_text[pos:pos+300], re.DOTALL):
-                        is_actual_article = True
-
-                    if not is_actual_article:
-                        continue
-
-                    # Try multiple extraction strategies for this position
-                    strategies = [
-                        # Strategy 1: Article to next kanji article number
-                        f"{article_pattern}.*?(?=第[一二三四五六七八九十百千]+条)",
-
-                        # Strategy 2: Article excluding next "第" character
-                        f"{article_pattern}[^第]*",
-
-                        # Strategy 3: Article to title pattern + next article
-                        f"{article_pattern}.*?(?=（[^）]*）\\s*第)",
-
-                        # Strategy 4: Fixed character limit
-                        f"{article_pattern}.{{0,2000}}"
-                    ]
-
-                    # Get context around this match
-                    context_start = max(0, pos - 20)
-                    context_end = min(len(extracted_text), pos + 3000)
-                    context = extracted_text[context_start:context_end]
-
-                    for strategy in strategies:
-                        matches_found = re.findall(strategy, context, re.DOTALL | re.MULTILINE)
-                        if matches_found:
-                            candidate = matches_found[0].strip()
-                            if len(candidate) > 50:
-                                # Score this candidate based on content quality
-                                content_score = 0
-
-                                # Heavily favor actual article content patterns
-                                content_score += 10  # Base score for being an actual article
-
-                                # Prefer longer content
-                                if len(candidate) > 200: content_score += 3
-                                elif len(candidate) > 100: content_score += 2
-
-                                # Prefer content with sentence endings
-                                if '。' in candidate: content_score += 3
-
-                                # Prefer content with commas (actual text)
-                                if '、' in candidate: content_score += 2
-
-                                # Prefer content with hiragana (actual content vs table)
-                                if re.search(r'[あ-ん]+', candidate): content_score += 3
-
-                                # Penalize reference patterns
-                                if '―' in candidate: content_score -= 5
-                                if candidate.count('第') > 3: content_score -= 2  # Too many references
-
-                                all_matches.append((content_score, candidate, pos))
-                                break
-
-                # Sort by content score (highest first) and take best matches
-                all_matches.sort(key=lambda x: x[0], reverse=True)
-
-                # Process top scored matches
-                for score, candidate, pos in all_matches[:3]:  # Take top 3 candidates
-                    if score > 10:  # Only accept high-quality actual articles
-                        clean_match = candidate.strip()
-                        # Accept matches that look like complete articles
-                        if len(clean_match) > 30 and clean_match not in matches:
-                            # Ensure we have a complete sentence/clause ending
-                            if clean_match.endswith(('。', '）', '）。', '号', '項', '条')):
-                                matches.append(clean_match)
-                            else:
-                                # Try to find a good stopping point
-                                for ending in ['。', '）。', '号。', '項。']:
-                                    if ending in clean_match:
-                                        last_pos = clean_match.rfind(ending)
-                                        if last_pos > len(clean_match) * 0.7:  # Must be in latter part
-                                            truncated = clean_match[:last_pos + len(ending)]
-                                            matches.append(truncated)
-                                            break
-                                else:
-                                    # If no good ending found, use as-is if substantial
-                                    if len(clean_match) > 100:
-                                        matches.append(clean_match)
+            # Step 3: 本則（MainProvision）から条文を取り出す
+            article = extract_article(law_full_text, article_number)
+            matches = [article["text"]] if article["status"] == "found" else []
 
             # Format result with formal name verification info
             law_info_data = data.get('law_info', {})
-            actual_law_title = law_info_data.get('law_title', formal_law_name)
+            actual_law_title = get_law_title(data)
+            law_title_verified = law_title_matches(data, formal_law_name)
 
             result = {
                 "law_info": law_info_data,
                 "search_law_name": original_law_input,
                 "formal_law_name_used": formal_law_name,
                 "actual_law_title": actual_law_title,
+                "law_title_verified": law_title_verified,
                 "name_conversion_applied": name_conversion_applied,
                 "search_article": article_number,
                 "found_law": actual_law_title,
@@ -866,28 +1094,37 @@ async def find_law_article(law_name: str, article_number: str, ctx: Context) -> 
                 "note": f"Searched for article '{article_number}' in '{actual_law_title}'{' (converted from: ' + original_law_input + ')' if name_conversion_applied else ''}",
                 "legal_analysis_instruction": prompt_loader.get_legal_analysis_instruction()
             }
+            if not law_title_verified:
+                result["law_title_warning"] = (
+                    f"Requested '{formal_law_name}' but the retrieved law is '{actual_law_title}' ({law_num}). "
+                    "Verify that this is the intended law."
+                )
+                await ctx.warning(result["law_title_warning"])
 
             if not matches:
-                # Smart suggestions for missing articles
-                main_num = re.search(r'(\d+)', article_number)
-                if main_num:
-                    article_num = main_num.group(1)
-                    kanji_num = arabic_to_kanji(article_num)
-                    basic_patterns = [f"第{kanji_num}条", f"第{article_num}条"]
-
-                    basic_found = any(re.search(re.escape(p), extracted_text) for p in basic_patterns)
-
-                    if basic_found:
-                        if 'の' in article_number:
-                            result["suggestion"] = f"Article {article_num} exists, but the specified 'の' variation may not exist."
-                        elif '項' in article_number or '号' in article_number:
-                            result["suggestion"] = f"Article {article_num} exists, but the specified paragraph (項) or subparagraph (号) may not exist."
-                        else:
-                            result["suggestion"] = f"Article found with different formatting. Try searching for just '{article_num}'."
+                status = article["status"]
+                if status == "invalid_reference":
+                    result["suggestion"] = (
+                        "Could not interpret the article number. "
+                        "Use forms such as '192', '325条の3', '第9条第2項' or '第2条第1項第3号の2'. "
+                        "Only articles in the main provision (本則) can be specified; "
+                        "supplementary provisions (附則) and sub-items such as イ or ロ are not supported "
+                        "(specify up to the item, 号)."
+                    )
+                else:
+                    article_label = format_article_label(article["article_num"])
+                    if status == "paragraph_not_found":
+                        result["suggestion"] = (
+                            f"{article_label} exists in {actual_law_title}, but the specified paragraph (項) does not exist."
+                        )
+                    elif status == "item_not_found":
+                        result["suggestion"] = (
+                            f"{article_label} exists in {actual_law_title}, but the specified subparagraph (号) does not exist."
+                        )
                     else:
-                        result["suggestion"] = f"Article {article_number} not found in {law_name}. Please verify the article number."
-
-                result["search_patterns_used"] = patterns[:5]
+                        result["suggestion"] = (
+                            f"{article_label} was not found in the main provision of {actual_law_title}. Please verify the article number."
+                        )
 
             await ctx.info(f"Successfully found article {article_number} in {result.get('actual_law_title', law_name)}")
             return result
@@ -1054,7 +1291,7 @@ async def get_law_content(law_id: str = "", law_num: str = "", response_format: 
                         "recommendation": "特定の条文を検索する場合は find_law_article ツールを使用してください。",
                         "law_stats": {
                             "original_size_bytes": len(response_str),
-                            "law_title": law_info.get('law_title', ''),
+                            "law_title": get_law_title(data),
                             "law_num": law_info.get('law_num', ''),
                             "promulgation_date": law_info.get('promulgation_date', '')
                         }
@@ -1179,24 +1416,17 @@ async def batch_find_articles(law_article_pairs: str, ctx: Context) -> dict:
                             
                             data = json.loads(response.text)
                             law_full_text = data.get('law_full_text', {})
-                            extracted_text = extract_text_from_xml(law_full_text)
-                            
-                            # Simple article search for batch processing
-                            patterns = generate_search_patterns(article_number)
-                            found_match = None
-                            
-                            for pattern in patterns[:3]:  # Use only first 3 patterns for speed
-                                article_pattern = re.escape(pattern)
-                                matches = re.findall(f"{article_pattern}.{{0,500}}", extracted_text, re.DOTALL)
-                                if matches:
-                                    found_match = matches[0].strip()
-                                    break
+                            article = extract_article(law_full_text, article_number)
+                            found_match = article["text"] if article["status"] == "found" else None
                             
                             # Prepare result
                             law_info_data = data.get('law_info', {})
+                            formal_law_name = LAW_ALIASES.get(law_name.strip(), law_name.strip())
                             result = {
                                 "law_info": law_info_data,
                                 "search_law_name": law_name,
+                                "actual_law_title": get_law_title(data),
+                                "law_title_verified": law_title_matches(data, formal_law_name),
                                 "search_article": article_number,
                                 "law_number": law_num,
                                 "found_article": found_match if found_match else None,
