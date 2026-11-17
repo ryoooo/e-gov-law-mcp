@@ -20,6 +20,7 @@ from fastmcp import Client
 
 import mcp_server
 from mcp_server import (
+    BASIC_LAWS,
     cache_manager,
     get_law_title,
     law_title_matches,
@@ -210,6 +211,11 @@ def tax_laws():
     }
 
 
+def test_basic_laws_include_tax_laws():
+    for name, num in tax_laws().items():
+        assert BASIC_LAWS.get(name) == num
+
+
 class TestRealApiRegression:
     """実 API での回帰テスト（固定対応を使わない経路、題名の食い違い、他のツール）"""
 
@@ -276,6 +282,7 @@ class TestRealApiRegression:
                 "昭和二十二年法律第五十四号（私的独占の禁止及び公正取引の確保に関する法律）",
             ),
             ("会社法", "2条3号の2", "平成十七年法律第八十六号", "会社法"),
+            ("商法", "1", "明治三十二年法律第四十八号", "商法"),
         ],
     )
     async def test_find_law_title(self, law_name, article, law_num, expected_title):
