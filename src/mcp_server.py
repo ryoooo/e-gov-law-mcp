@@ -223,18 +223,9 @@ class CacheManager:
 
         # API lookup
         try:
-            response = await client.get("/laws", params={
-                "law_title": law_name,
-                "law_type": "Act",
-                "limit": 5
-            })
-            response.raise_for_status()
-
-            data = json.loads(response.text)
-            laws = data.get("laws", [])
-
-            if laws:
-                law_num = laws[0].get("law_info", {}).get("law_num")
+            best_law = await search_law_by_title(client, law_name)
+            if best_law:
+                law_num = best_law.get("law_info", {}).get("law_num")
                 if law_num:
                     self.law_lookup_cache.put(cache_key, law_num)
                     return law_num
@@ -356,6 +347,7 @@ class ConfigLoader:
             "著作権": "著作権法",
             "特許": "特許法",
             "建基法": "建築基準法",
+            "憲法": "日本国憲法",
 
             # 分野別検索
             "税法": "所得税法",
@@ -579,6 +571,119 @@ def generate_search_patterns(article_input: str) -> list[str]:
     # Remove duplicates while preserving order
     return list(dict.fromkeys(patterns))
 
+
+# ---------------------------------------------------------------------------
+# 法令の選択
+#
+# e-Gov API v2 では、法令の題名は revision_info.law_title にあり、law_info には
+# 法令番号・法令ID・公布日しかない。また /laws の law_title は部分一致で検索される
+# ため、「消費税法」で検索すると、題名に「消費税法」を含む改正法や特例法
+# （平成二十四年法律第六十八号など）も候補に入る。
+# そのため、題名が入力と一致する候補を、他のどの条件よりも優先する。
+# ---------------------------------------------------------------------------
+
+
+def get_law_title(law: dict[str, Any]) -> str:
+    """e-Gov API v2 のレコード（/laws の 1 件、または /law_data の応答）から題名を返す。"""
+    revision_info = law.get("revision_info") or {}
+    return revision_info.get("law_title") or ""
+
+
+def get_law_abbrevs(law: dict[str, Any]) -> set[str]:
+    """登録された略称（revision_info.abbrev。カンマ区切り）を返す。"""
+    abbrev = (law.get("revision_info") or {}).get("abbrev") or ""
+    return {a.strip() for a in re.split(r"[,，、]", abbrev) if a.strip()}
+
+
+def is_law_repealed(law: dict[str, Any]) -> bool:
+    """廃止・失効の印があれば True（廃止されていない場合、API は文字列 "None" を返す）。"""
+    status = (law.get("revision_info") or {}).get("repeal_status")
+    return status not in (None, "", "None")
+
+
+def _title_equals(title: str, name: str) -> bool:
+    """題名の完全一致。「昭和二十二年法律第五十四号（…）」の形の題名にも対応する。"""
+    return title == name or title.endswith(f"（{name}）")
+
+
+def law_title_matches(law: dict[str, Any], law_name: str) -> bool:
+    """
+    レコードが law_name という名前の法令であれば True。
+
+    題名の完全一致、「法令番号（題名）」の形（独占禁止法など）、登録された略称の
+    いずれかで判定する。
+    """
+    name = law_name.strip()
+    if not name:
+        return False
+    return _title_equals(get_law_title(law), name) or name in get_law_abbrevs(law)
+
+
+def select_best_law(laws: list[dict[str, Any]], law_name: str) -> Optional[dict[str, Any]]:
+    """
+    /laws の検索結果から、law_name に最もよく当たる法令を選ぶ。
+
+    優先順位: 題名の完全一致 > 略称の一致 > 廃止されていない > 題名が短い
+    （その法令を題名に含むだけの法令より、本体の法令を選ぶ） > 公布日が新しい
+    """
+    if not laws:
+        return None
+    name = law_name.strip()
+
+    def sort_key(law: dict[str, Any]) -> tuple[bool, bool, bool, int, str]:
+        title = get_law_title(law)
+        return (
+            _title_equals(title, name),
+            name in get_law_abbrevs(law),
+            not is_law_repealed(law),
+            -len(title) if title else -(10**6),
+            (law.get("law_info") or {}).get("promulgation_date") or "",
+        )
+
+    return max(laws, key=sort_key)
+
+
+async def search_law_by_title(client: httpx.AsyncClient, law_name: str) -> Optional[dict[str, Any]]:
+    """
+    題名で /laws を検索し、最もよく当たる法令のレコードを返す。
+
+    まず法律（law_type=Act）に絞って検索する。題名が一致する法律がなければ、種別を絞らずに
+    検索し直す（日本国憲法や、施行令・施行規則などは Act ではないため）。
+    """
+    response = await client.get(
+        "/laws", params={"law_title": law_name, "law_type": "Act", "limit": 20}
+    )
+    response.raise_for_status()
+    laws = json.loads(response.text).get("laws", [])
+    best_law = select_best_law(laws, law_name)
+
+    if best_law is None or not law_title_matches(best_law, law_name):
+        response = await client.get("/laws", params={"law_title": law_name, "limit": 20})
+        response.raise_for_status()
+        any_type_laws = json.loads(response.text).get("laws", [])
+        any_type_best = select_best_law(any_type_laws, law_name)
+        if any_type_best is not None and (
+            best_law is None or law_title_matches(any_type_best, law_name)
+        ):
+            best_law = any_type_best
+            laws = any_type_laws
+
+    if best_law is None:
+        return None
+
+    logger.info(f"Found {len(laws)} candidate laws for '{law_name}'")
+    for i, law in enumerate(laws[:3]):  # 上位 3 件をログに残す
+        logger.info(
+            f"  Candidate {i+1}: {get_law_title(law) or 'N/A'} ({(law.get('law_info') or {}).get('law_num', 'N/A')})"
+        )
+    if not law_title_matches(best_law, law_name):
+        logger.warning(
+            f"No exact title match for '{law_name}'; using closest candidate: "
+            f"{get_law_title(best_law)} ({(best_law.get('law_info') or {}).get('law_num')})"
+        )
+    return best_law
+
+
 async def smart_law_lookup(law_name: str) -> Optional[str]:
     """Smart law lookup with formal name verification and direct mapping fallback to search."""
     law_name_clean = law_name.strip()
@@ -607,64 +712,13 @@ async def smart_law_lookup(law_name: str) -> Optional[str]:
 
     # Step 4: Intelligent search for unknown laws
     async with await get_http_client() as client:
-        response = await client.get("/laws", params={
-            "law_title": law_name_clean,
-            "law_type": "Act",
-            "limit": 20
-        })
-        response.raise_for_status()
-
-        data = json.loads(response.text)
-        laws = data.get("laws", [])
-
-        if not laws:
+        best_law = await search_law_by_title(client, law_name_clean)
+        if best_law is None:
             logger.warning(f"No laws found for search term: {law_name_clean} (original: {original_input})")
             return None
 
-        # Log search results for transparency
-        logger.info(f"Found {len(laws)} candidate laws for '{law_name_clean}' (original: '{original_input}')")
-        for i, law in enumerate(laws[:3]):  # Log top 3 candidates
-            law_info = law.get('law_info', {})
-            logger.info(f"  Candidate {i+1}: {law_info.get('law_title', 'N/A')} ({law_info.get('law_num', 'N/A')})")
-
-        # Smart scoring for best law selection
-        def score_law(law_info):
-            law_num = law_info.get("law_num", "")
-            score = 0
-
-            # Era preference (modern laws preferred)
-            if "令和" in law_num: score += 3000
-            elif "平成" in law_num: score += 2000
-            elif "昭和" in law_num: score += 1000
-            elif "明治" in law_num: score += 500
-
-            # Prefer shorter law numbers (basic laws)
-            if len(law_num) < 25: score += 100
-
-            # Year extraction for tie-breaking
-            year_match = re.search(r'([元一二三四五六七八九十]+)年', law_num)
-            if year_match:
-                year_str = year_match.group(1)
-                if year_str == "元": score += 1
-                else:
-                    # Simple kanji to number conversion
-                    kanji_map = {"一": 1, "二": 2, "三": 3, "四": 4, "五": 5,
-                               "六": 6, "七": 7, "八": 8, "九": 9, "十": 10}
-                    if "十" in year_str:
-                        parts = year_str.split("十")
-                        tens = kanji_map.get(parts[0], 1) if parts[0] else 1
-                        ones = kanji_map.get(parts[1], 0) if parts[1] else 0
-                        score += tens * 10 + ones
-                    else:
-                        score += kanji_map.get(year_str, 0)
-
-            return score
-
-        best_law = max(laws, key=lambda law: score_law(law.get("law_info", {})))
-        selected_law_num = best_law.get("law_info", {}).get("law_num")
-        selected_law_title = best_law.get("law_info", {}).get("law_title")
-
-        logger.info(f"Selected law: {selected_law_title} ({selected_law_num}) for search term '{law_name_clean}' (original: '{original_input}')")
+        selected_law_num = (best_law.get("law_info") or {}).get("law_num")
+        logger.info(f"Selected law: {get_law_title(best_law)} ({selected_law_num}) for search term '{law_name_clean}' (original: '{original_input}')")
 
         # Cache the result
         if selected_law_num:
@@ -850,13 +904,15 @@ async def find_law_article(law_name: str, article_number: str, ctx: Context) -> 
 
             # Format result with formal name verification info
             law_info_data = data.get('law_info', {})
-            actual_law_title = law_info_data.get('law_title', formal_law_name)
+            actual_law_title = get_law_title(data)
+            law_title_verified = law_title_matches(data, formal_law_name)
 
             result = {
                 "law_info": law_info_data,
                 "search_law_name": original_law_input,
                 "formal_law_name_used": formal_law_name,
                 "actual_law_title": actual_law_title,
+                "law_title_verified": law_title_verified,
                 "name_conversion_applied": name_conversion_applied,
                 "search_article": article_number,
                 "found_law": actual_law_title,
@@ -866,6 +922,12 @@ async def find_law_article(law_name: str, article_number: str, ctx: Context) -> 
                 "note": f"Searched for article '{article_number}' in '{actual_law_title}'{' (converted from: ' + original_law_input + ')' if name_conversion_applied else ''}",
                 "legal_analysis_instruction": prompt_loader.get_legal_analysis_instruction()
             }
+            if not law_title_verified:
+                result["law_title_warning"] = (
+                    f"Requested '{formal_law_name}' but the retrieved law is '{actual_law_title}' ({law_num}). "
+                    "Verify that this is the intended law."
+                )
+                await ctx.warning(result["law_title_warning"])
 
             if not matches:
                 # Smart suggestions for missing articles
@@ -1054,7 +1116,7 @@ async def get_law_content(law_id: str = "", law_num: str = "", response_format: 
                         "recommendation": "特定の条文を検索する場合は find_law_article ツールを使用してください。",
                         "law_stats": {
                             "original_size_bytes": len(response_str),
-                            "law_title": law_info.get('law_title', ''),
+                            "law_title": get_law_title(data),
                             "law_num": law_info.get('law_num', ''),
                             "promulgation_date": law_info.get('promulgation_date', '')
                         }
@@ -1194,9 +1256,12 @@ async def batch_find_articles(law_article_pairs: str, ctx: Context) -> dict:
                             
                             # Prepare result
                             law_info_data = data.get('law_info', {})
+                            formal_law_name = LAW_ALIASES.get(law_name.strip(), law_name.strip())
                             result = {
                                 "law_info": law_info_data,
                                 "search_law_name": law_name,
+                                "actual_law_title": get_law_title(data),
+                                "law_title_verified": law_title_matches(data, formal_law_name),
                                 "search_article": article_number,
                                 "law_number": law_num,
                                 "found_article": found_match if found_match else None,
